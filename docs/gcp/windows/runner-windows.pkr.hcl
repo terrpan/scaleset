@@ -1,11 +1,15 @@
 # runner-windows.pkr.hcl -- Packer template for building a GCP Windows
-# runner image.
+# runner image (boot-optimized).
 #
-# The image is based on Windows Server 2022 and includes:
+# The image is based on Windows Server 2025 Core and includes:
 #   - GitHub Actions runner agent
-#   - Docker (Windows containers via DockerMsftProvider)
+#   - Docker CE (static binaries from Docker)
 #   - Git for Windows
-#   - A Scheduled Task that reads JIT config from instance metadata on boot
+#   - Boot optimizations:
+#       * Disabled Windows Defender real-time monitoring
+#       * Disabled unnecessary Windows services
+#       * High Performance power plan
+#       * 32 GB disk for faster image attach
 #
 # Build:
 #   packer init .
@@ -49,8 +53,14 @@ variable "image_family" {
 
 variable "runner_version" {
   type        = string
-  default     = "2.321.0"
+  default     = "2.331.0"
   description = "GitHub Actions runner agent version to install."
+}
+
+variable "docker_version" {
+  type        = string
+  default     = "29.2.1"
+  description = "Docker CE version to install (from Docker static binaries)."
 }
 
 variable "machine_type" {
@@ -62,7 +72,55 @@ variable "machine_type" {
 variable "disk_size" {
   type        = number
   default     = 50
-  description = "Boot disk size in GB for the build VM."
+  description = "Boot disk size in GB for the build VM. Must be at least 50 GB."
+}
+
+variable "network" {
+  type        = string
+  default     = "default"
+  description = "VPC network for the build VM."
+}
+
+variable "subnetwork" {
+  type        = string
+  default     = ""
+  description = "Subnetwork for the build VM. If empty, the default subnet for the zone is used."
+}
+
+variable "source_image_family" {
+  type        = string
+  default     = "windows-2025-core"
+  description = "Source image family to use for the build VM. windows-2025-core is slimmer than Desktop Experience."
+}
+
+variable "source_image_project_id" {
+  type        = string
+  default     = "windows-cloud"
+  description = "GCP project containing the source image."
+}
+
+variable "omit_external_ip" {
+  type        = bool
+  default     = false
+  description = "Do not assign an external IP to the build VM. Requires use_internal_ip and VPC connectivity."
+}
+
+variable "use_internal_ip" {
+  type        = bool
+  default     = false
+  description = "Connect to the build VM via its internal IP. Requires network connectivity to the VPC."
+}
+
+variable "tags" {
+  type        = list(string)
+  default     = ["packer-winrm"]
+  description = "Network tags to apply to the build VM. Default includes 'packer-winrm' for the WinRM firewall rule."
+}
+
+variable "dism_cleanup" {
+  type        = bool
+  default     = false
+  description = "Run DISM /ResetBase cleanup to shrink image size. Saves ~2 GB but adds 20-40 min to build time. Not needed for ephemeral runners."
 }
 
 # ---------------------------------------------------------------------------
@@ -74,17 +132,24 @@ source "googlecompute" "runner-windows" {
   zone         = var.zone
   machine_type = var.machine_type
 
-  source_image_family  = "windows-2022"
-  source_image_project = "windows-cloud"
+  source_image_family     = var.source_image_family
+  source_image_project_id = var.source_image_project_id != "" ? [var.source_image_project_id] : null
+
+  network    = var.network
+  subnetwork = var.subnetwork != "" ? var.subnetwork : null
+
+  omit_external_ip = var.omit_external_ip
+  use_internal_ip  = var.use_internal_ip
+  tags             = var.tags
 
   image_name        = "${var.image_name}-{{timestamp}}"
   image_family      = var.image_family
-  image_description = "GitHub Actions runner image for scaleset (Windows Server 2022)"
+  image_description = "GitHub Actions runner image for scaleset (Windows Server 2025 Core, boot-optimized)"
 
   disk_size = var.disk_size
   disk_type = "pd-ssd"
 
-  communicator = "winrm"
+  communicator   = "winrm"
   winrm_username = "packer"
   winrm_insecure = true
   winrm_use_ssl  = true
@@ -113,14 +178,24 @@ build {
     script = "${path.root}/scripts/install-runner.ps1"
     environment_vars = [
       "RUNNER_VERSION=${var.runner_version}",
+      "DOCKER_VERSION=${var.docker_version}",
     ]
   }
 
-  # Reboot after Docker/Containers feature install, then verify.
+  # Reboot after Containers feature install (required for vmcompute.dll).
   provisioner "windows-restart" {
     restart_timeout = "15m"
   }
 
+  # Phase 2: Register dockerd service and cleanup (runs after reboot).
+  provisioner "powershell" {
+    script = "${path.root}/scripts/install-runner-phase2.ps1"
+    environment_vars = [
+      "DISM_CLEANUP=${var.dism_cleanup}",
+    ]
+  }
+
+  # Verify installation.
   provisioner "powershell" {
     inline = [
       "Write-Host 'Verifying Docker installation...'",
@@ -128,6 +203,8 @@ build {
       "docker version",
       "Write-Host 'Verifying runner installation...'",
       "Test-Path C:\\actions-runner\\run.cmd",
+      "Write-Host 'Verifying scheduled task...'",
+      "Get-ScheduledTask -TaskName ScalesetRunner",
       "Write-Host 'Image build complete.'",
     ]
   }

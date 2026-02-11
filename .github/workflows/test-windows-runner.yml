@@ -1,0 +1,44 @@
+name: Test Windows Runner
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-windows-runner:
+    name: Windows Runner Test
+    runs-on: my-scaleset-windows
+
+    steps:
+      - name: Show Runner Info
+        run: |
+          Write-Host "=== Runner Environment ==="
+          Write-Host "Runner OS: $env:RUNNER_OS"
+          Write-Host "Runner Architecture: $env:RUNNER_ARCH"
+          Write-Host "Runner Name: $env:RUNNER_NAME"
+          Write-Host "Computer Name: $env:COMPUTERNAME"
+          Write-Host ""
+
+      - name: Docker Version
+        run: |
+          Write-Host "=== Docker Version ==="
+          docker version
+          Write-Host ""
+
+      - name: Docker Info
+        run: |
+          Write-Host "=== Docker Info ==="
+          docker info
+          Write-Host ""
+
+      - name: Test Windows Container
+        run: |
+          Write-Host "=== Windows Container Test ==="
+          Write-Host "Pulling nanoserver image..."
+          docker pull mcr.microsoft.com/windows/nanoserver:ltsc2025
+          
+          Write-Host ""
+          Write-Host "Running hello world container..."
+          docker run --rm mcr.microsoft.com/windows/nanoserver:ltsc2025 cmd /c "echo Hello from Windows container!"
+          
+          Write-Host ""
+          Write-Host "Test completed successfully!"

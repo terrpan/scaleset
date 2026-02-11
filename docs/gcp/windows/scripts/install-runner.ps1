@@ -1,15 +1,19 @@
 # install-runner.ps1 -- Packer provisioner script for building GCP Windows
-# runner images.
+# runner images (boot-optimized).
 #
-# Installs on Windows Server 2022:
-#   - Chocolatey package manager
-#   - Git for Windows
-#   - Docker (Windows containers via DockerMsftProvider)
+# Installs on Windows Server 2025 Core:
+#   - Git for Windows (direct download, no Chocolatey)
+#   - Docker CE (static binaries from Docker)
 #   - GitHub Actions runner agent
 #   - Scheduled Task to run startup.ps1 on boot
+#   - Disables unnecessary services for faster boot
+#   - Disables Windows Defender real-time monitoring
+#   - Sets High Performance power plan
+#   - Aggressive cleanup for smallest image
 #
 # Variables (passed via Packer environment_vars):
-#   RUNNER_VERSION  -- GitHub Actions runner version (e.g. "2.321.0")
+#   RUNNER_VERSION  -- GitHub Actions runner version (e.g. "2.331.0")
+#   DOCKER_VERSION  -- Docker CE version (e.g. "27.5.1")
 
 $ErrorActionPreference = "Stop"
 
@@ -19,63 +23,67 @@ if (-not $RunnerVersion) {
     exit 1
 }
 
+$DockerVersion = $env:DOCKER_VERSION
+if (-not $DockerVersion) {
+    Write-Error "DOCKER_VERSION environment variable must be set"
+    exit 1
+}
+
 $RunnerHome = "C:\actions-runner"
 $ScalesetDir = "C:\scaleset"
 
 # ---------------------------------------------------------------------------
-# Chocolatey
+# Git for Windows (direct download, no Chocolatey)
 # ---------------------------------------------------------------------------
-Write-Host ">>> Installing Chocolatey"
-Set-ExecutionPolicy Bypass -Scope Process -Force
-[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+Write-Host ">>> Installing Git for Windows"
 
-# Reload PATH so choco is available.
+$GitVersion = "2.47.1"
+$GitInstaller = "Git-$GitVersion-64-bit.exe"
+$GitUrl = "https://github.com/git-for-windows/git/releases/download/v$GitVersion.windows.1/$GitInstaller"
+$GitInstallerPath = "$env:TEMP\$GitInstaller"
+
+Write-Host "Downloading $GitUrl"
+Invoke-WebRequest -Uri $GitUrl -OutFile $GitInstallerPath -UseBasicParsing
+
+Write-Host "Installing Git (silent)"
+Start-Process -FilePath $GitInstallerPath -ArgumentList "/VERYSILENT","/NORESTART","/NOCANCEL","/SP-","/CLOSEAPPLICATIONS","/RESTARTAPPLICATIONS","/COMPONENTS=icons,ext\reg\shellhere,assoc,assoc_sh" -Wait -NoNewWindow
+
+Remove-Item -Path $GitInstallerPath -Force
+
+# Reload PATH to pick up git
 $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + `
             [System.Environment]::GetEnvironmentVariable("Path", "User")
 
 # ---------------------------------------------------------------------------
-# Git
+# Docker CE (static binaries from Docker)
 # ---------------------------------------------------------------------------
-Write-Host ">>> Installing Git"
-choco install git -y --no-progress
-# Reload PATH for git.
-$env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + `
-            [System.Environment]::GetEnvironmentVariable("Path", "User")
-
-# ---------------------------------------------------------------------------
-# Docker (Windows containers)
-# ---------------------------------------------------------------------------
-Write-Host ">>> Installing Docker (Windows containers)"
+Write-Host ">>> Installing Docker CE $DockerVersion"
 
 # Install the Containers feature (required for Docker on Windows Server).
+Write-Host "Enabling Containers feature"
 Install-WindowsFeature -Name Containers -Restart:$false
 
-# Install Docker via DockerMsftProvider.
-Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force
-Install-Module DockerMsftProvider -Force
-Install-Package Docker -ProviderName DockerMsftProvider -Force
+# Download Docker CE static binaries
+$DockerZip = "docker-$DockerVersion.zip"
+$DockerUrl = "https://download.docker.com/win/static/stable/x86_64/$DockerZip"
+$DockerZipPath = "$env:TEMP\$DockerZip"
 
-# Docker service will start after reboot with the Containers feature.
-# Packer will reboot automatically if needed.
+Write-Host "Downloading $DockerUrl"
+Invoke-WebRequest -Uri $DockerUrl -OutFile $DockerZipPath -UseBasicParsing
 
-# ---------------------------------------------------------------------------
-# GitHub Actions runner agent
-# ---------------------------------------------------------------------------
-Write-Host ">>> Installing GitHub Actions runner $RunnerVersion"
+Write-Host "Extracting to $env:ProgramFiles"
+Expand-Archive -Path $DockerZipPath -DestinationPath $env:ProgramFiles -Force
+Remove-Item -Path $DockerZipPath -Force
 
-New-Item -ItemType Directory -Path $RunnerHome -Force | Out-Null
+# Add Docker to system PATH
+$dockerPath = "$env:ProgramFiles\docker"
+$currentPath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::Machine)
+if ($currentPath -notlike "*$dockerPath*") {
+    [Environment]::SetEnvironmentVariable("Path", "$currentPath;$dockerPath", [EnvironmentVariableTarget]::Machine)
+}
+$env:Path += ";$dockerPath"
 
-$RunnerZip = "actions-runner-win-x64-$RunnerVersion.zip"
-$RunnerUrl = "https://github.com/actions/runner/releases/download/v$RunnerVersion/$RunnerZip"
-$RunnerZipPath = "$env:TEMP\$RunnerZip"
-
-Write-Host "Downloading $RunnerUrl"
-Invoke-WebRequest -Uri $RunnerUrl -OutFile $RunnerZipPath -UseBasicParsing
-
-Write-Host "Extracting to $RunnerHome"
-Expand-Archive -Path $RunnerZipPath -DestinationPath $RunnerHome -Force
-Remove-Item -Path $RunnerZipPath -Force
+Write-Host "Docker CE binaries installed (service registration after reboot)"
 
 # ---------------------------------------------------------------------------
 # Startup script & Scheduled Task
@@ -112,10 +120,60 @@ Register-ScheduledTask `
     -Settings $Settings `
     -Force
 
-# ---------------------------------------------------------------------------
-# Cleanup
-# ---------------------------------------------------------------------------
-Write-Host ">>> Cleaning up"
-choco cache remove -y 2>$null
+Write-Host "ScalesetRunner scheduled task registered"
 
-Write-Host ">>> Done"
+# ---------------------------------------------------------------------------
+# Disable unnecessary services for faster boot
+# ---------------------------------------------------------------------------
+Write-Host ">>> Disabling unnecessary services"
+
+$disableServices = @(
+    "wuauserv",       # Windows Update
+    "UsoSvc",         # Update Orchestrator
+    "DiagTrack",      # Diagnostics Tracking (telemetry)
+    "SysMain",        # Superfetch/Prefetch
+    "WerSvc",         # Windows Error Reporting
+    "Spooler",        # Print Spooler
+    "WSearch",        # Windows Search
+    "MapsBroker",     # Downloaded Maps Manager
+    "lfsvc"           # Geolocation Service
+)
+
+foreach ($svc in $disableServices) {
+    try {
+        $service = Get-Service -Name $svc -ErrorAction SilentlyContinue
+        if ($service) {
+            Write-Host "Disabling service: $svc"
+            Set-Service -Name $svc -StartupType Disabled -ErrorAction Stop
+        }
+    } catch {
+        Write-Host "Could not disable $svc (may not exist on Server Core): $_"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Disable Windows Defender real-time monitoring
+# ---------------------------------------------------------------------------
+Write-Host ">>> Disabling Windows Defender real-time monitoring"
+
+try {
+    Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop
+    Write-Host "Real-time monitoring disabled"
+
+    # Add path exclusions for runner and Docker
+    Add-MpPreference -ExclusionPath $RunnerHome -ErrorAction Stop
+    Add-MpPreference -ExclusionPath "$env:ProgramFiles\docker" -ErrorAction Stop
+    Add-MpPreference -ExclusionPath "C:\ProgramData\docker" -ErrorAction Stop
+    Write-Host "Defender exclusions added"
+} catch {
+    Write-Host "Could not configure Windows Defender: $_"
+}
+
+# ---------------------------------------------------------------------------
+# Set High Performance power plan
+# ---------------------------------------------------------------------------
+Write-Host ">>> Setting High Performance power plan"
+powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+
+Write-Host ">>> Phase 1 complete (will reboot to activate Containers feature)"
+
