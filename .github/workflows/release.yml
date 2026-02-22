@@ -61,29 +61,44 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          KO_DOCKER_REPO: ghcr.io/terrpan/scalesettest
           GORELEASER_CURRENT_TAG: ${{ env.RELEASE_TAG }}
 
       - name: Extract image reference
         id: image-ref
         run: |
-          IMAGE="ghcr.io/terrpan/scalesettest/scaleset:${{ env.RELEASE_TAG }}"
-          # Pull the digest for the multi-arch index
-          DIGEST=$(docker manifest inspect "${IMAGE}" 2>/dev/null | jq -r '.digest // empty' || true)
-          if [ -z "${DIGEST}" ]; then
-            # Fallback: get digest from GoReleaser artifacts
-            DIGEST=$(echo '${{ steps.goreleaser.outputs.artifacts }}' | jq -r '.[] | select(.type=="Docker Manifest" or .type=="Docker Image") | .extra.Digest // empty' | head -1)
+          # Parse the actual image name and digest from GoReleaser artifacts JSON.
+          # This avoids hardcoding the registry path which may differ from what Ko publishes.
+          ARTIFACTS='${{ steps.goreleaser.outputs.artifacts }}'
+
+          # Get the Docker Manifest entry (multi-arch index produced by Ko)
+          MANIFEST_NAME=$(echo "${ARTIFACTS}" | jq -r '[.[] | select(.type=="Docker Manifest")][0].name // empty')
+          DIGEST=$(echo "${ARTIFACTS}" | jq -r '[.[] | select(.type=="Docker Manifest")][0].extra.Digest // empty')
+
+          if [ -z "${MANIFEST_NAME}" ]; then
+            # Fallback to Docker Image if no manifest index
+            MANIFEST_NAME=$(echo "${ARTIFACTS}" | jq -r '[.[] | select(.type=="Docker Image")][0].name // empty')
+            DIGEST=$(echo "${ARTIFACTS}" | jq -r '[.[] | select(.type=="Docker Image")][0].extra.Digest // empty')
           fi
+
+          # MANIFEST_NAME looks like "ghcr.io/terrpan/scalesettest@sha256:abc..."
+          # Extract just the repository (everything before @)
+          REPO="${MANIFEST_NAME%%@*}"
+
+          # For Trivy and display, use the tag-based reference
+          IMAGE="${REPO}:${{ env.RELEASE_TAG }}"
+
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "repo=${REPO}" >> "$GITHUB_OUTPUT"
           echo "Image: ${IMAGE}"
           echo "Digest: ${DIGEST}"
+          echo "Repo: ${REPO}"
 
       - name: Attest build provenance
         if: steps.image-ref.outputs.digest != ''
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: ghcr.io/terrpan/scalesettest/scaleset
+          subject-name: ${{ steps.image-ref.outputs.repo }}
           subject-digest: ${{ steps.image-ref.outputs.digest }}
           push-to-registry: true
 
