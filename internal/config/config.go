@@ -14,6 +14,7 @@ import (
 	"github.com/actions/scaleset"
 	"gopkg.in/yaml.v3"
 
+	"github.com/terrpan/scaleset/internal/buildinfo"
 	"github.com/terrpan/scaleset/internal/engine"
 	"github.com/terrpan/scaleset/internal/engine/docker"
 	"github.com/terrpan/scaleset/internal/engine/gcp"
@@ -314,7 +315,7 @@ func (c *Config) ApplyDefaults() {
 	// OTel defaults: disabled by default, insecure=true for local dev
 	if !c.OTel.Enabled {
 		// If explicitly disabled, ensure insecure defaults to true for when enabled
-		if c.OTel.Insecure == false && c.OTel.Endpoint == "" {
+		if !c.OTel.Insecure && c.OTel.Endpoint == "" {
 			c.OTel.Insecure = true
 		}
 	}
@@ -463,8 +464,8 @@ func (c *Config) NewScalesetClient() (*scaleset.Client, error) {
 	sysInfo := scaleset.SystemInfo{
 		System:    "terrpan-scaleset",
 		Subsystem: "cli",
-		Version:   "0.1.0",
-		CommitSHA: "dev",
+		Version:   buildinfo.Version,
+		CommitSHA: buildinfo.Commit,
 	}
 
 	if c.GitHub.App.ClientID != "" {
