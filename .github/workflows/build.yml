@@ -56,7 +56,6 @@ jobs:
           args: release --snapshot --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          KO_DOCKER_REPO: ghcr.io/terrpan/scalesettest
 
       - name: Push snapshot image
         if: github.event_name != 'pull_request'
@@ -67,14 +66,20 @@ jobs:
           SHA="${{ github.sha }}"
           SHORT_SHA="${SHA:0:7}"
 
-          # Tag the snapshot image with the short SHA and push
-          # Ko/GoReleaser snapshot images are loaded into the local Docker daemon
+          # Try to tag and push the snapshot image with the short SHA.
+          # In snapshot mode, Ko loads images into the local Docker daemon.
           if docker image inspect "${IMAGE}:latest" >/dev/null 2>&1; then
             docker tag "${IMAGE}:latest" "${IMAGE}:${SHORT_SHA}"
             docker push "${IMAGE}:${SHORT_SHA}"
             echo "image=${IMAGE}:${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          elif docker image inspect "${IMAGE}:snapshot" >/dev/null 2>&1; then
+            docker tag "${IMAGE}:snapshot" "${IMAGE}:${SHORT_SHA}"
+            docker push "${IMAGE}:${SHORT_SHA}"
+            echo "image=${IMAGE}:${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::Snapshot image not found in local Docker daemon"
+            echo "::warning::Snapshot image not found in local Docker daemon — skipping push"
+            # List available images for debugging
+            docker images --filter "reference=ghcr.io/terrpan/*" --format "table {{.Repository}}:{{.Tag}}" || true
           fi
         id: image-ref
 
