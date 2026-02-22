@@ -1,0 +1,81 @@
+name: Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_patch:
+        description: "Force a patch bump even if no conventional commits warrant it"
+        required: false
+        default: "false"
+        type: boolean
+      dry_run:
+        description: "Show what version would be created without actually tagging"
+        required: false
+        default: "false"
+        type: boolean
+
+permissions:
+  contents: write   # Required to push tags
+
+concurrency:
+  group: version
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Bump Version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Required for svu to read full tag history
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install svu
+        run: go install github.com/caarlos0/svu/v3@latest
+
+      - name: Determine version
+        id: version
+        run: |
+          CURRENT=$(svu current)
+          echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ inputs.force_patch }}" = "true" ]; then
+            NEXT=$(svu next --force-patch-increment)
+          else
+            NEXT=$(svu next)
+          fi
+          echo "next=${NEXT}" >> "$GITHUB_OUTPUT"
+
+          if [ "${CURRENT}" = "${NEXT}" ]; then
+            echo "bump=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No version bump needed (current: ${CURRENT})"
+          else
+            echo "bump=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Version bump: ${CURRENT} → ${NEXT}"
+          fi
+
+      - name: Create and push tag
+        if: steps.version.outputs.bump == 'true' && inputs.dry_run == false
+        run: |
+          NEXT="${{ steps.version.outputs.next }}"
+          git tag -a "${NEXT}" -m "${NEXT}"
+          git push origin "${NEXT}"
+          echo "::notice::Pushed tag ${NEXT} — release workflow will trigger automatically"
+
+      - name: Summary
+        run: |
+          echo "## Version Bump" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Current | \`${{ steps.version.outputs.current }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Next | \`${{ steps.version.outputs.next }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Bump needed | ${{ steps.version.outputs.bump }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Dry run | ${{ inputs.dry_run }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Force patch | ${{ inputs.force_patch }} |" >> "$GITHUB_STEP_SUMMARY"

@@ -1,35 +1,34 @@
-name: Build
+name: Release
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+    tags: ["v*"]
 
 # Default to read-only; jobs escalate as needed.
 permissions:
   contents: read
 
 concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: release-${{ github.ref }}
+  cancel-in-progress: false   # Never cancel a release in progress
 
 jobs:
-  build:
-    name: Build & Push
+  release:
+    name: GoReleaser
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      packages: write      # Push snapshot images to GHCR on main
-      id-token: write      # OIDC signing / attestation
+      contents: write      # Create GitHub release & upload assets
+      packages: write      # Push container images to GHCR
+      id-token: write      # OIDC for attestation
       attestations: write  # GitHub artifact attestations
     outputs:
       image: ${{ steps.image-ref.outputs.image }}
+      digest: ${{ steps.image-ref.outputs.digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # Required for GoReleaser snapshot versioning
+          fetch-depth: 0   # Required for GoReleaser changelog and tag history
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -37,60 +36,59 @@ jobs:
           go-version-file: go.mod
 
       - name: Login to GHCR
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # GoReleaser --snapshot validates the full release pipeline without
-      # publishing a GitHub release. On PRs this is a dry-run; on main pushes
-      # it builds and pushes a dev snapshot image to GHCR.
-      - name: GoReleaser snapshot
+      - name: Run GoReleaser
         id: goreleaser
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release --snapshot --clean
+          args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KO_DOCKER_REPO: ghcr.io/terrpan/scalesettest
 
-      - name: Push snapshot image
-        if: github.event_name != 'pull_request'
-        run: |
-          # GoReleaser snapshot builds the image locally but doesn't push.
-          # Push the snapshot image to GHCR for dev/testing.
-          IMAGE="ghcr.io/terrpan/scalesettest/scaleset"
-          SHA="${{ github.sha }}"
-          SHORT_SHA="${SHA:0:7}"
-
-          # Tag the snapshot image with the short SHA and push
-          # Ko/GoReleaser snapshot images are loaded into the local Docker daemon
-          if docker image inspect "${IMAGE}:latest" >/dev/null 2>&1; then
-            docker tag "${IMAGE}:latest" "${IMAGE}:${SHORT_SHA}"
-            docker push "${IMAGE}:${SHORT_SHA}"
-            echo "image=${IMAGE}:${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::Snapshot image not found in local Docker daemon"
-          fi
+      - name: Extract image reference
         id: image-ref
+        run: |
+          # GoReleaser outputs artifacts as JSON; extract the Ko image digest
+          IMAGE="ghcr.io/terrpan/scalesettest/scaleset:${{ github.ref_name }}"
+          # Pull the digest for the multi-arch index
+          DIGEST=$(docker manifest inspect "${IMAGE}" 2>/dev/null | jq -r '.digest // empty' || true)
+          if [ -z "${DIGEST}" ]; then
+            # Fallback: get digest via crane if available, or from GoReleaser artifacts
+            DIGEST=$(echo '${{ steps.goreleaser.outputs.artifacts }}' | jq -r '.[] | select(.type=="Docker Manifest" or .type=="Docker Image") | .extra.Digest // empty' | head -1)
+          fi
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Image: ${IMAGE}"
+          echo "Digest: ${DIGEST}"
+
+      - name: Attest build provenance
+        if: steps.image-ref.outputs.digest != ''
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/terrpan/scalesettest/scaleset
+          subject-digest: ${{ steps.image-ref.outputs.digest }}
+          push-to-registry: true
 
   # ---------------------------------------------------------------------------
-  # Vulnerability Scan — scans the snapshot image on main pushes
-  # Release images are scanned by the release workflow instead.
+  # Vulnerability Scan — scans the released image with Trivy
   # ---------------------------------------------------------------------------
   vulnerability-scan:
     name: Vulnerability Scan
-    needs: build
+    needs: release
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' && needs.build.outputs.image != ''
+    if: needs.release.outputs.image != ''
     permissions:
       contents: read
       packages: read
-      security-events: write  # Upload SARIF to Security tab
+      security-events: write   # Upload SARIF to Security tab
     steps:
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -102,7 +100,7 @@ jobs:
       - name: Trivy vulnerability scan
         uses: aquasecurity/trivy-action@0.30.0
         with:
-          image-ref: ${{ needs.build.outputs.image }}
+          image-ref: ${{ needs.release.outputs.image }}
           format: json
           output: trivy-results.json
           severity: CRITICAL,HIGH,MEDIUM
@@ -110,7 +108,7 @@ jobs:
       - name: Trivy SARIF report
         uses: aquasecurity/trivy-action@0.30.0
         with:
-          image-ref: ${{ needs.build.outputs.image }}
+          image-ref: ${{ needs.release.outputs.image }}
           format: sarif
           output: trivy-results.sarif
           severity: CRITICAL,HIGH,MEDIUM
@@ -119,12 +117,12 @@ jobs:
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-results.sarif
-          category: trivy-container
+          category: trivy-release
 
       - name: Upload vulnerability report
         uses: actions/upload-artifact@v4
         with:
-          name: vulnerability-report
+          name: vulnerability-report-${{ github.ref_name }}
           path: |
             trivy-results.json
             trivy-results.sarif
