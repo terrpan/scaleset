@@ -21,13 +21,24 @@ import (
 	"github.com/terrpan/scaleset/internal/engine"
 )
 
+// JitConfigGenerator abstracts the scaleset client method used by the
+// Scaler so that tests can provide a mock implementation.  The real
+// *scaleset.Client satisfies this interface implicitly.
+type JitConfigGenerator interface {
+	GenerateJitRunnerConfig(
+		ctx context.Context,
+		jitRunnerSetting *scaleset.RunnerScaleSetJitRunnerSetting,
+		scaleSetID int,
+	) (*scaleset.RunnerScaleSetJitRunnerConfig, error)
+}
+
 // Config holds the parameters the Scaler needs that are not
 // engine-specific.
 type Config struct {
 	ScaleSetID     int
 	MinRunners     int
 	MaxRunners     int
-	ScalesetClient *scaleset.Client
+	ScalesetClient JitConfigGenerator
 	Engine         engine.Engine
 	Logger         *slog.Logger
 }
@@ -36,7 +47,7 @@ type Config struct {
 // busy) and delegates provisioning / cleanup to the configured Engine.
 type Scaler struct {
 	engine         engine.Engine
-	scalesetClient *scaleset.Client
+	scalesetClient JitConfigGenerator
 	scaleSetID     int
 	minRunners     int
 	maxRunners     int
@@ -240,7 +251,7 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 // HandleJobStarted is called when GitHub assigns a job to one of our
 // runners.
 func (s *Scaler) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStarted) error {
-	ctx, span := s.tracer.Start(ctx, "scaler.HandleJobStarted")
+	_, span := s.tracer.Start(ctx, "scaler.HandleJobStarted")
 	defer span.End()
 
 	span.SetAttributes(

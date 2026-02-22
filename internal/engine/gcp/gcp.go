@@ -15,6 +15,7 @@ import (
 
 	compute "cloud.google.com/go/compute/apiv1"
 	computepb "cloud.google.com/go/compute/apiv1/computepb"
+	gax "github.com/googleapis/gax-go/v2"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -22,6 +23,39 @@ import (
 
 	"github.com/terrpan/scaleset/internal/engine"
 )
+
+// instancesAPI abstracts the GCP Compute Engine Instances client so that
+// tests can provide a mock implementation.
+type instancesAPI interface {
+	Insert(ctx context.Context, req *computepb.InsertInstanceRequest) (operationWaiter, error)
+	Delete(ctx context.Context, req *computepb.DeleteInstanceRequest) (operationWaiter, error)
+	Close() error
+}
+
+// operationWaiter abstracts a long-running GCP operation.  The real
+// *compute.Operation satisfies this interface implicitly.
+type operationWaiter interface {
+	Wait(ctx context.Context, opts ...gax.CallOption) error
+}
+
+// realInstancesClient wraps *compute.InstancesClient to satisfy
+// instancesAPI, adapting the return type from *compute.Operation to
+// operationWaiter.
+type realInstancesClient struct {
+	c *compute.InstancesClient
+}
+
+func (r *realInstancesClient) Insert(ctx context.Context, req *computepb.InsertInstanceRequest) (operationWaiter, error) {
+	return r.c.Insert(ctx, req)
+}
+
+func (r *realInstancesClient) Delete(ctx context.Context, req *computepb.DeleteInstanceRequest) (operationWaiter, error) {
+	return r.c.Delete(ctx, req)
+}
+
+func (r *realInstancesClient) Close() error {
+	return r.c.Close()
+}
 
 // Config holds GCP-specific engine settings.
 type Config struct {
@@ -63,8 +97,8 @@ type Config struct {
 
 // Engine manages GitHub Actions runners as GCP Compute Engine VMs.
 type Engine struct {
-	client   *compute.InstancesClient
-	opClient *compute.ZoneOperationsClient
+	client   instancesAPI
+	opClient closerOnly
 	cfg      Config
 	logger   *slog.Logger
 
@@ -73,6 +107,13 @@ type Engine struct {
 
 	// OpenTelemetry instrumentation
 	tracer trace.Tracer
+}
+
+// closerOnly is used for the zone operations client which is only
+// held for cleanup.  The actual operation waiting is done through the
+// operationWaiter returned by Insert/Delete.
+type closerOnly interface {
+	Close() error
 }
 
 // Compile-time check that Engine satisfies the engine.Engine interface.
@@ -97,10 +138,15 @@ func New(ctx context.Context, cfg Config, logger *slog.Logger) (*Engine, error) 
 
 	opClient, err := compute.NewZoneOperationsRESTClient(ctx)
 	if err != nil {
-		client.Close()
+		_ = client.Close()
 		return nil, fmt.Errorf("gcp zone operations client: %w", err)
 	}
 
+	return newEngine(&realInstancesClient{c: client}, opClient, cfg, logger), nil
+}
+
+// newEngine is the internal constructor used by New and by tests.
+func newEngine(client instancesAPI, opClient closerOnly, cfg Config, logger *slog.Logger) *Engine {
 	logger.Info("gcp engine initialized",
 		slog.String("project", cfg.Project),
 		slog.String("zone", cfg.Zone),
@@ -115,7 +161,7 @@ func New(ctx context.Context, cfg Config, logger *slog.Logger) (*Engine, error) 
 		logger:    logger,
 		instances: make(map[string]string),
 		tracer:    otel.Tracer("scaleset/engine/gcp"),
-	}, nil
+	}
 }
 
 // StartRunner creates and starts a GCP VM that runs a GitHub Actions

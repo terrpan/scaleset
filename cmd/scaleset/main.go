@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -12,9 +13,12 @@ import (
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 
+	"github.com/terrpan/scaleset/internal/buildinfo"
 	"github.com/terrpan/scaleset/internal/config"
+	"github.com/terrpan/scaleset/internal/health"
 	"github.com/terrpan/scaleset/internal/otel"
 	"github.com/terrpan/scaleset/internal/scaler"
 )
@@ -39,6 +43,7 @@ ephemeral runners using a pluggable compute engine (Docker, EC2, etc.).
 
 Configuration is read from a YAML file (--config) with optional CLI
 flag overrides for the most common settings.`,
+	Version:      buildinfo.Version,
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt)
@@ -141,6 +146,7 @@ func run(ctx context.Context) error {
 	// ---------------------------------------------------------------
 	// 2.5. Initialize OpenTelemetry / Prometheus (if enabled)
 	// ---------------------------------------------------------------
+	var httpSrvShutdown func(context.Context) error
 	if cfg.OTel.Enabled || cfg.Prometheus.Enable {
 		promPort := 0
 		if cfg.Prometheus.Enable {
@@ -172,6 +178,38 @@ func run(ctx context.Context) error {
 				slog.String("endpoint", fmt.Sprintf("http://0.0.0.0:%d/metrics", cfg.Prometheus.Port)),
 			)
 		}
+	}
+
+	// ---------------------------------------------------------------
+	// 2.6. Start HTTP server for /healthz and optionally /metrics
+	// ---------------------------------------------------------------
+	if cfg.Prometheus.Enable || true { // Always start for at least /healthz
+		mux := http.NewServeMux()
+		mux.HandleFunc("/healthz", health.Handler(cfg.Engine.EnabledEngine()))
+		if cfg.Prometheus.Enable {
+			mux.Handle("/metrics", promhttp.Handler())
+		}
+		httpSrv := &http.Server{
+			Addr:    fmt.Sprintf(":%d", cfg.Prometheus.Port),
+			Handler: mux,
+		}
+		go func() {
+			if srvErr := httpSrv.ListenAndServe(); srvErr != nil && !errors.Is(srvErr, http.ErrServerClosed) {
+				logger.Error("HTTP server error", slog.String("error", srvErr.Error()))
+			}
+		}()
+		httpSrvShutdown = httpSrv.Shutdown
+		logger.Info("HTTP server started",
+			slog.String("endpoint", fmt.Sprintf("http://0.0.0.0:%d", cfg.Prometheus.Port)),
+			slog.String("endpoints", "/healthz, /metrics (if enabled)"),
+		)
+	}
+	if httpSrvShutdown != nil {
+		defer func() {
+			if err := httpSrvShutdown(context.WithoutCancel(ctx)); err != nil {
+				logger.Error("HTTP server shutdown error", slog.String("error", err.Error()))
+			}
+		}()
 	}
 
 	// ---------------------------------------------------------------
@@ -240,8 +278,8 @@ func run(ctx context.Context) error {
 	scalesetClient.SetSystemInfo(scaleset.SystemInfo{
 		System:     "terrpan-scaleset",
 		Subsystem:  "cli",
-		Version:    "0.1.0",
-		CommitSHA:  "dev",
+		Version:    buildinfo.Version,
+		CommitSHA:  buildinfo.Commit,
 		ScaleSetID: scaleSet.ID,
 	})
 
@@ -279,7 +317,11 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("creating message session: %w", err)
 	}
-	defer sessionClient.Close(context.Background())
+	defer func() {
+		if err := sessionClient.Close(context.Background()); err != nil {
+			logger.Error("session client close error", slog.String("error", err.Error()))
+		}
+	}()
 
 	// ---------------------------------------------------------------
 	// 8. Create listener + scaler
