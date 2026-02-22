@@ -1,0 +1,121 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# GoReleaser configuration for scaleset
+# https://goreleaser.com/customization/
+
+version: 2
+
+# ── Project ───────────────────────────────────────────────────────────
+project_name: scaleset
+
+# ── Builds ────────────────────────────────────────────────────────────
+# Binary builds — also used as the base config for the Ko container
+# image (kos section inherits main, ldflags, env from the matched build).
+builds:
+  - id: scaleset
+    main: ./cmd/scaleset
+    binary: scaleset
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/terrpan/scaleset/internal/buildinfo.Version={{.Tag}}
+      - -X github.com/terrpan/scaleset/internal/buildinfo.Commit={{.ShortCommit}}
+      - -X github.com/terrpan/scaleset/internal/buildinfo.BuildTime={{.Date}}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+# ── Ko (container images) ────────────────────────────────────────────
+# Ko rebuilds the binary internally but inherits ldflags/env from the
+# linked build entry. The .ko.yaml file is ignored — all config lives here.
+kos:
+  - id: scaleset-image
+    build: scaleset
+    base_image: cgr.dev/chainguard/static
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    repositories:
+      - ghcr.io/terrpan/scalesettest/scaleset
+    tags:
+      - "{{.Tag}}"
+      - "{{if not .Prerelease}}latest{{end}}"
+    sbom: spdx
+    bare: true          # Use base-import-paths style (image name = binary name)
+    labels:
+      org.opencontainers.image.title: scaleset
+      org.opencontainers.image.description: GitHub Actions Runner Scale Set autoscaler
+      org.opencontainers.image.url: https://github.com/terrpan/scalesettest
+      org.opencontainers.image.source: https://github.com/terrpan/scalesettest
+      org.opencontainers.image.version: "{{.Tag}}"
+      org.opencontainers.image.revision: "{{.FullCommit}}"
+      org.opencontainers.image.licenses: MIT
+
+# ── Archives ──────────────────────────────────────────────────────────
+archives:
+  - id: scaleset-archive
+    builds:
+      - scaleset
+    format: tar.gz
+    format_overrides:
+      - goos: windows
+        format: zip
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+# ── Checksum ──────────────────────────────────────────────────────────
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+# ── Changelog ─────────────────────────────────────────────────────────
+# Groups commits by conventional commit type for readable release notes.
+changelog:
+  sort: asc
+  groups:
+    - title: "Breaking Changes"
+      regexp: '^.*?(\w+)(\(.*\))?!:.+$'
+      order: 0
+    - title: "Features"
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: "Bug Fixes"
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 2
+    - title: "Performance"
+      regexp: '^.*?perf(\([[:word:]]+\))??!?:.+$'
+      order: 3
+    - title: "Documentation"
+      regexp: '^.*?docs(\([[:word:]]+\))??!?:.+$'
+      order: 4
+    - title: "Other"
+      order: 999
+  filters:
+    exclude:
+      - "^chore:"
+      - "^ci:"
+      - "^test:"
+      - "^style:"
+
+# ── Release ───────────────────────────────────────────────────────────
+release:
+  github:
+    owner: terrpan
+    name: scalesettest
+  draft: false
+  prerelease: auto
+  name_template: "{{.Tag}}"
+  footer: |
+    ## Container Image
+
+    ```
+    docker pull ghcr.io/terrpan/scalesettest/scaleset:{{.Tag}}
+    ```
+
+    ## Verify SBOM
+
+    The container image includes an embedded SPDX SBOM.
